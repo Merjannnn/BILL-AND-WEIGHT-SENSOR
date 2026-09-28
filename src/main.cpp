@@ -20,7 +20,8 @@ byte nextWeightSample = 0;
 const byte billPin = 3;
 const byte coinPin = 2;
 
-const unsigned long DEBOUNCE_US = 15000;    // 15ms bounce rejection
+const unsigned long BILL_DEBOUNCE_US = 15000;
+const unsigned long COIN_DEBOUNCE_US = 5000;
 const unsigned long PULSE_TIMEOUT_MS = 300; // pulse train "done" after this silence
 
 volatile int billPulse = 0;
@@ -47,14 +48,27 @@ long totalMoney = 0;
 #define R_EN3 46
 #define L_EN3 47
 const int DISPENSE_SPEED = 255;
-const int FINE_DISPENSE_SPEED = 110;
-const float FINE_APPROACH_KG = 0.20;
+const int APPROACH_SPEED_1 = 200;
+const int APPROACH_SPEED_2 = 160;
+const int APPROACH_SPEED_3 = 130;
+const int APPROACH_SPEED_4 = 110;
+const float APPROACH_WEIGHT_1_KG = 0.50;
+const float APPROACH_WEIGHT_2_KG = 0.25;
+const float APPROACH_WEIGHT_3_KG = 0.12;
+const float APPROACH_WEIGHT_4_KG = 0.05;
+const unsigned long MOTOR_STOP_LEAD_MS = 350;
+const unsigned long MOTOR_CLOSE_SETTLE_MS = 5000;
+const unsigned long DISPENSE_RATE_SAMPLE_MS = 1000;
+const unsigned long DISPENSE_RATE_STALE_MS = 2500;
+const float MIN_RATE_SAMPLE_DELTA_KG = 0.005;
+const float MIN_STOP_MARGIN_KG = 0.005;
 
 // ---- Overall cycle state machine ----
 enum CycleState
 {
   IDLE,
   DISPENSING,
+  DISPENSE_SETTLING,
   MOTOR_TEST
 };
 
@@ -64,7 +78,12 @@ byte selectedMotor = 0;
 unsigned long stateStartMs = 0;
 const unsigned long MOTOR_TEST_DURATION_MS = 5000;
 const unsigned long DISPENSE_TIMEOUT_MS = 30000;
-bool fineDispenseMode = false;
+int currentDispenseSpeed = 0;
+float previousRateWeightKg = 0.0;
+float dispensingRateKgPerSec = 0.0;
+unsigned long previousRateSampleMs = 0;
+unsigned long lastPositiveRateMs = 0;
+bool rateSampleReady = false;
 
 // ---- Serial command buffer ----
 String serialBuffer = "";
@@ -78,7 +97,9 @@ void processCommand(String cmd);
 void runCycleStateMachine();
 void startDispense(String riceType, float kg);
 void updateWeightReading();
+void updateDispenseMotorSpeed();
 void setSelectedDispenseSpeed(int speed);
+void completeDispenseCycle();
 
 // ============================================================
 // ISRs
@@ -86,7 +107,7 @@ void setSelectedDispenseSpeed(int speed);
 void billISR()
 {
   unsigned long now = micros();
-  if (now - lastBillEdge > DEBOUNCE_US)
+  if (now - lastBillEdge > BILL_DEBOUNCE_US)
   {
     billPulse++;
     lastBillPulseTime = millis();
@@ -97,7 +118,7 @@ void billISR()
 void coinISR()
 {
   unsigned long now = micros();
-  if (now - lastCoinEdge > DEBOUNCE_US)
+  if (now - lastCoinEdge > COIN_DEBOUNCE_US)
   {
     coinPulse++;
     lastCoinPulseTime = millis();
@@ -195,6 +216,28 @@ void updateWeightReading()
 
   if (cycleState == DISPENSING)
   {
+    if (!rateSampleReady)
+    {
+      previousRateWeightKg = currentWeightKg;
+      previousRateSampleMs = now;
+      rateSampleReady = true;
+    }
+    else if (now - previousRateSampleMs >= DISPENSE_RATE_SAMPLE_MS)
+    {
+      float elapsedSeconds = (now - previousRateSampleMs) / 1000.0;
+      float weightGainKg = currentWeightKg - previousRateWeightKg;
+      if (weightGainKg >= MIN_RATE_SAMPLE_DELTA_KG)
+      {
+        float measuredRate = weightGainKg / elapsedSeconds;
+        dispensingRateKgPerSec = dispensingRateKgPerSec == 0.0
+                                     ? measuredRate
+                                     : dispensingRateKgPerSec * 0.75 + measuredRate * 0.25;
+        lastPositiveRateMs = now;
+      }
+      previousRateWeightKg = currentWeightKg;
+      previousRateSampleMs = now;
+    }
+
     Serial.print("WEIGHT:");
     Serial.println(currentWeightKg * 1000.0, 2);
   }
@@ -203,40 +246,55 @@ void updateWeightReading()
 // ============================================================
 // Bill / Coin handling
 // ============================================================
-void processBillPulse()
+int billValue(int pulses)
 {
-  noInterrupts();
-  int count = billPulse;
-  billPulse = 0;
-  interrupts();
+  switch (pulses)
+  {
+  case 2:
+    return 20;
+  case 5:
+    return 50;
+  case 10:
+    return 100;
+  case 20:
+    return 200;
+  case 50:
+    return 500;
+  case 100:
+    return 1000;
+  default:
+    return 0;
+  }
+}
 
+int coinValue(int pulses)
+{
+  switch (pulses)
+  {
+  case 1:
+    return 1;
+  case 5:
+    return 5;
+  case 10:
+    return 10;
+  case 20:
+    return 20;
+  default:
+    return 0;
+  }
+}
+
+void processBillPulse(int count)
+{
   Serial.print("Bill Pulse: ");
   Serial.println(count);
 
-  if (count == 10)
+  int value = billValue(count);
+  if (value > 0)
   {
-    totalMoney += 100;
-    Serial.println("Bill: PHP 100");
-  }
-  else if (count == 20)
-  {
-    totalMoney += 200;
-    Serial.println("Bill: PHP 200");
-  }
-  else if (count == 25)
-  {
-    totalMoney += 250;
-    Serial.println("Bill: PHP 250");
-  }
-  else if (count == 30)
-  {
-    totalMoney += 300;
-    Serial.println("Bill: PHP 300");
-  }
-  else if (count == 50)
-  {
-    totalMoney += 500;
-    Serial.println("Bill: PHP 500");
+    totalMoney += value;
+    Serial.print("Bill: PHP ");
+    Serial.println(value);
   }
   else
   {
@@ -249,30 +307,17 @@ void processBillPulse()
   Serial.println(totalMoney);
 }
 
-void processCoinPulse()
+void processCoinPulse(int count)
 {
-  noInterrupts();
-  int count = coinPulse;
-  coinPulse = 0;
-  interrupts();
-
   Serial.print("Coin Pulse: ");
   Serial.println(count);
 
-  if (count == 9)
+  int value = coinValue(count);
+  if (value > 0)
   {
-    totalMoney += 10;
-    Serial.println("Coin: PHP 10");
-  }
-  else if (count == 18)
-  {
-    totalMoney += 20;
-    Serial.println("Coin: PHP 20");
-  }
-  else if (count == 27)
-  {
-    totalMoney += 30;
-    Serial.println("Coin: PHP 30");
+    totalMoney += value;
+    Serial.print("Coin: PHP ");
+    Serial.println(value);
   }
   else
   {
@@ -287,17 +332,47 @@ void processCoinPulse()
 
 void handleBillPulses()
 {
-  if (billPulse > 0 && (millis() - lastBillPulseTime > PULSE_TIMEOUT_MS))
+  noInterrupts();
+  int count = billPulse;
+  unsigned long lastPulseTime = lastBillPulseTime;
+  interrupts();
+
+  if (count > 0 && millis() - lastPulseTime > PULSE_TIMEOUT_MS)
   {
-    processBillPulse();
+    noInterrupts();
+    count = billPulse;
+    lastPulseTime = lastBillPulseTime;
+    if (count > 0 && millis() - lastPulseTime > PULSE_TIMEOUT_MS)
+      billPulse = 0;
+    else
+      count = 0;
+    interrupts();
+
+    if (count > 0)
+      processBillPulse(count);
   }
 }
 
 void handleCoinPulses()
 {
-  if (coinPulse > 0 && (millis() - lastCoinPulseTime > PULSE_TIMEOUT_MS))
+  noInterrupts();
+  int count = coinPulse;
+  unsigned long lastPulseTime = lastCoinPulseTime;
+  interrupts();
+
+  if (count > 0 && millis() - lastPulseTime > PULSE_TIMEOUT_MS)
   {
-    processCoinPulse();
+    noInterrupts();
+    count = coinPulse;
+    lastPulseTime = lastCoinPulseTime;
+    if (count > 0 && millis() - lastPulseTime > PULSE_TIMEOUT_MS)
+      coinPulse = 0;
+    else
+      count = 0;
+    interrupts();
+
+    if (count > 0)
+      processCoinPulse(count);
   }
 }
 
@@ -441,7 +516,12 @@ void startDispense(String riceType, float kg)
   weightReadingAvailable = false;
   weightSampleCount = 0;
   nextWeightSample = 0;
-  fineDispenseMode = false;
+  currentDispenseSpeed = 0;
+  previousRateWeightKg = 0.0;
+  dispensingRateKgPerSec = 0.0;
+  previousRateSampleMs = 0;
+  lastPositiveRateMs = 0;
+  rateSampleReady = false;
   for (byte index = 0; index < WEIGHT_AVERAGE_SAMPLES; index++)
     weightSamples[index] = 0;
   lastWeightReadMs = 0;
@@ -454,6 +534,7 @@ void startDispense(String riceType, float kg)
   Serial.println(kg, 2);
 
   startSelectedDispenseMotor();
+  currentDispenseSpeed = DISPENSE_SPEED;
 }
 
 void runCycleStateMachine()
@@ -463,34 +544,49 @@ void runCycleStateMachine()
   switch (cycleState)
   {
   case DISPENSING:
-    if (weightReadingAvailable && !fineDispenseMode &&
-        currentWeightKg >= targetWeightKg - FINE_APPROACH_KG)
-    {
-      fineDispenseMode = true;
-      setSelectedDispenseSpeed(FINE_DISPENSE_SPEED);
-      Serial.println("DISPENSE_FINE_MODE");
-    }
-
     if (weightReadingAvailable && currentWeightKg >= targetWeightKg)
     {
-      stopAllDispenseMotors();
-      Serial.println("MOTOR_STOPPED");
-      Serial.print("DISPENSE_DONE:");
-      Serial.println(currentWeightKg, 2);
-      Serial.println("CYCLE_DONE");
-      cycleState = IDLE;
-      selectedRiceType = "";
-      selectedMotor = 0;
-      fineDispenseMode = false;
+      completeDispenseCycle();
     }
-    else if (now - stateStartMs >= DISPENSE_TIMEOUT_MS)
+    else if (weightReadingAvailable)
+    {
+      updateDispenseMotorSpeed();
+      float remainingKg = targetWeightKg - currentWeightKg;
+      float stopMarginKg = MIN_STOP_MARGIN_KG;
+      if (dispensingRateKgPerSec > 0.0 &&
+          now - lastPositiveRateMs <= DISPENSE_RATE_STALE_MS)
+      {
+        float estimatedFlowKg = dispensingRateKgPerSec * MOTOR_STOP_LEAD_MS / 1000.0;
+        if (estimatedFlowKg > stopMarginKg)
+          stopMarginKg = estimatedFlowKg;
+      }
+
+      if (remainingKg <= stopMarginKg)
+      {
+        stopAllDispenseMotors();
+        Serial.println("MOTOR_STOPPING_FOR_TARGET");
+        cycleState = DISPENSE_SETTLING;
+        stateStartMs = now;
+      }
+    }
+
+    if (cycleState == DISPENSING && now - stateStartMs >= DISPENSE_TIMEOUT_MS)
     {
       stopAllDispenseMotors();
       Serial.println("ERROR:DISPENSE_TIMEOUT");
       cycleState = IDLE;
       selectedRiceType = "";
       selectedMotor = 0;
-      fineDispenseMode = false;
+      currentDispenseSpeed = 0;
+    }
+    break;
+
+  case DISPENSE_SETTLING:
+    if (weightReadingAvailable &&
+        (currentWeightKg >= targetWeightKg ||
+         now - stateStartMs >= MOTOR_CLOSE_SETTLE_MS))
+    {
+      completeDispenseCycle();
     }
     break;
 
@@ -508,6 +604,19 @@ void runCycleStateMachine()
   default:
     break;
   }
+}
+
+void completeDispenseCycle()
+{
+  stopAllDispenseMotors();
+  Serial.println("MOTOR_STOPPED");
+  Serial.print("DISPENSE_DONE:");
+  Serial.println(currentWeightKg, 2);
+  Serial.println("CYCLE_DONE");
+  cycleState = IDLE;
+  selectedRiceType = "";
+  selectedMotor = 0;
+  currentDispenseSpeed = 0;
 }
 
 // ============================================================
@@ -562,7 +671,6 @@ void startSelectedDispenseMotor()
     digitalWrite(LPWM3, LOW);
     analogWrite(RPWM3, DISPENSE_SPEED);
   }
-
   Serial.print("MOTOR_START:");
   Serial.println(selectedMotor);
 }
@@ -575,4 +683,27 @@ void setSelectedDispenseSpeed(int speed)
     analogWrite(RPWM2, speed);
   else if (selectedMotor == 3)
     analogWrite(RPWM3, speed);
+}
+
+void updateDispenseMotorSpeed()
+{
+  float remainingKg = targetWeightKg - currentWeightKg;
+  int requestedSpeed = DISPENSE_SPEED;
+
+  if (remainingKg <= APPROACH_WEIGHT_4_KG)
+    requestedSpeed = APPROACH_SPEED_4;
+  else if (remainingKg <= APPROACH_WEIGHT_3_KG)
+    requestedSpeed = APPROACH_SPEED_3;
+  else if (remainingKg <= APPROACH_WEIGHT_2_KG)
+    requestedSpeed = APPROACH_SPEED_2;
+  else if (remainingKg <= APPROACH_WEIGHT_1_KG)
+    requestedSpeed = APPROACH_SPEED_1;
+
+  if (requestedSpeed < currentDispenseSpeed)
+  {
+    setSelectedDispenseSpeed(requestedSpeed);
+    currentDispenseSpeed = requestedSpeed;
+    Serial.print("DISPENSE_SPEED:");
+    Serial.println(requestedSpeed);
+  }
 }
