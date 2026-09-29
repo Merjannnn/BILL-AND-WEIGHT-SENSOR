@@ -47,6 +47,8 @@ long totalMoney = 0;
 #define LPWM3 45
 #define R_EN3 46
 #define L_EN3 47
+const byte MOTOR_CLOSED_LIMIT_PIN = 24;
+const byte MOTOR_CLOSED_LIMIT_ACTIVE = LOW;
 const int DISPENSE_SPEED = 255;
 const int APPROACH_SPEED_1 = 200;
 const int APPROACH_SPEED_2 = 160;
@@ -58,9 +60,13 @@ const float APPROACH_WEIGHT_3_KG = 0.12;
 const float APPROACH_WEIGHT_4_KG = 0.05;
 const unsigned long MOTOR_STOP_LEAD_MS = 350;
 const unsigned long MOTOR_CLOSE_SETTLE_MS = 5000;
+const unsigned long MOTOR_DIRECTION_DEADTIME_MS = 100;
+const unsigned long MOTOR_CLOSE_TIMEOUT_MS = 15000;
+const int MOTOR_CLOSE_SPEED = 130;
 const unsigned long DISPENSE_RATE_SAMPLE_MS = 1000;
 const unsigned long DISPENSE_RATE_STALE_MS = 2500;
 const float MIN_RATE_SAMPLE_DELTA_KG = 0.005;
+const float MIN_WEIGHT_PROGRESS_DELTA_KG = 0.002;
 const float MIN_STOP_MARGIN_KG = 0.005;
 
 // ---- Overall cycle state machine ----
@@ -69,6 +75,8 @@ enum CycleState
   IDLE,
   DISPENSING,
   DISPENSE_SETTLING,
+  DISPENSE_CLOSE_PAUSE,
+  DISPENSE_CLOSING,
   MOTOR_TEST
 };
 
@@ -77,7 +85,8 @@ String selectedRiceType = "";
 byte selectedMotor = 0;
 unsigned long stateStartMs = 0;
 const unsigned long MOTOR_TEST_DURATION_MS = 5000;
-const unsigned long DISPENSE_TIMEOUT_MS = 30000;
+const unsigned long DISPENSE_MAX_DURATION_MS = 300000;
+const unsigned long DISPENSE_NO_PROGRESS_TIMEOUT_MS = 15000;
 int currentDispenseSpeed = 0;
 float previousRateWeightKg = 0.0;
 float dispensingRateKgPerSec = 0.0;
@@ -99,7 +108,9 @@ void startDispense(String riceType, float kg);
 void updateWeightReading();
 void updateDispenseMotorSpeed();
 void setSelectedDispenseSpeed(int speed);
+void startSelectedDispenseMotorClosing();
 void completeDispenseCycle();
+void finishDispenseCycle();
 
 // ============================================================
 // ISRs
@@ -136,6 +147,7 @@ void setup()
   // Bill / Coin
   pinMode(billPin, INPUT_PULLUP);
   pinMode(coinPin, INPUT_PULLUP);
+  pinMode(MOTOR_CLOSED_LIMIT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(billPin), billISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(coinPin), coinISR, FALLING);
 
@@ -226,6 +238,8 @@ void updateWeightReading()
     {
       float elapsedSeconds = (now - previousRateSampleMs) / 1000.0;
       float weightGainKg = currentWeightKg - previousRateWeightKg;
+      if (weightGainKg >= MIN_WEIGHT_PROGRESS_DELTA_KG)
+        lastPositiveRateMs = now;
       if (weightGainKg >= MIN_RATE_SAMPLE_DELTA_KG)
       {
         float measuredRate = weightGainKg / elapsedSeconds;
@@ -520,13 +534,13 @@ void startDispense(String riceType, float kg)
   previousRateWeightKg = 0.0;
   dispensingRateKgPerSec = 0.0;
   previousRateSampleMs = 0;
-  lastPositiveRateMs = 0;
   rateSampleReady = false;
   for (byte index = 0; index < WEIGHT_AVERAGE_SAMPLES; index++)
     weightSamples[index] = 0;
   lastWeightReadMs = 0;
   cycleState = DISPENSING;
   stateStartMs = millis();
+  lastPositiveRateMs = stateStartMs;
 
   Serial.print("DISPENSE_START:");
   Serial.print(selectedRiceType);
@@ -570,10 +584,14 @@ void runCycleStateMachine()
       }
     }
 
-    if (cycleState == DISPENSING && now - stateStartMs >= DISPENSE_TIMEOUT_MS)
+    if (cycleState == DISPENSING &&
+        (now - stateStartMs >= DISPENSE_MAX_DURATION_MS ||
+         now - lastPositiveRateMs >= DISPENSE_NO_PROGRESS_TIMEOUT_MS))
     {
       stopAllDispenseMotors();
-      Serial.println("ERROR:DISPENSE_TIMEOUT");
+      Serial.println(now - stateStartMs >= DISPENSE_MAX_DURATION_MS
+                         ? "ERROR:DISPENSE_TIMEOUT"
+                         : "ERROR:DISPENSE_NO_WEIGHT_PROGRESS");
       cycleState = IDLE;
       selectedRiceType = "";
       selectedMotor = 0;
@@ -587,6 +605,38 @@ void runCycleStateMachine()
          now - stateStartMs >= MOTOR_CLOSE_SETTLE_MS))
     {
       completeDispenseCycle();
+    }
+    break;
+
+  case DISPENSE_CLOSE_PAUSE:
+    if (digitalRead(MOTOR_CLOSED_LIMIT_PIN) == MOTOR_CLOSED_LIMIT_ACTIVE)
+    {
+      finishDispenseCycle();
+    }
+    else if (now - stateStartMs >= MOTOR_DIRECTION_DEADTIME_MS)
+    {
+      startSelectedDispenseMotorClosing();
+      Serial.println("MOTOR_CLOSING");
+      cycleState = DISPENSE_CLOSING;
+      stateStartMs = now;
+    }
+    break;
+
+  case DISPENSE_CLOSING:
+    if (digitalRead(MOTOR_CLOSED_LIMIT_PIN) == MOTOR_CLOSED_LIMIT_ACTIVE)
+    {
+      stopAllDispenseMotors();
+      Serial.println("MOTOR_CLOSE_LIMIT_REACHED");
+      finishDispenseCycle();
+    }
+    else if (now - stateStartMs >= MOTOR_CLOSE_TIMEOUT_MS)
+    {
+      stopAllDispenseMotors();
+      Serial.println("ERROR:MOTOR_CLOSE_LIMIT_NOT_REACHED");
+      cycleState = IDLE;
+      selectedRiceType = "";
+      selectedMotor = 0;
+      currentDispenseSpeed = 0;
     }
     break;
 
@@ -609,6 +659,12 @@ void runCycleStateMachine()
 void completeDispenseCycle()
 {
   stopAllDispenseMotors();
+  cycleState = DISPENSE_CLOSE_PAUSE;
+  stateStartMs = millis();
+}
+
+void finishDispenseCycle()
+{
   Serial.println("MOTOR_STOPPED");
   Serial.print("DISPENSE_DONE:");
   Serial.println(currentWeightKg, 2);
@@ -683,6 +739,31 @@ void setSelectedDispenseSpeed(int speed)
     analogWrite(RPWM2, speed);
   else if (selectedMotor == 3)
     analogWrite(RPWM3, speed);
+}
+
+void startSelectedDispenseMotorClosing()
+{
+  if (selectedMotor == 1)
+  {
+    digitalWrite(R_EN1, HIGH);
+    digitalWrite(L_EN1, HIGH);
+    digitalWrite(RPWM1, LOW);
+    analogWrite(LPWM1, MOTOR_CLOSE_SPEED);
+  }
+  else if (selectedMotor == 2)
+  {
+    digitalWrite(R_EN2, HIGH);
+    digitalWrite(L_EN2, HIGH);
+    digitalWrite(RPWM2, LOW);
+    analogWrite(LPWM2, MOTOR_CLOSE_SPEED);
+  }
+  else if (selectedMotor == 3)
+  {
+    digitalWrite(R_EN3, HIGH);
+    digitalWrite(L_EN3, HIGH);
+    digitalWrite(RPWM3, LOW);
+    analogWrite(LPWM3, MOTOR_CLOSE_SPEED);
+  }
 }
 
 void updateDispenseMotorSpeed()
