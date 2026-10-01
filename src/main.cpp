@@ -625,7 +625,6 @@ void runCycleStateMachine()
   case DISPENSE_CLOSING:
     if (digitalRead(MOTOR_CLOSED_LIMIT_PIN) == MOTOR_CLOSED_LIMIT_ACTIVE)
     {
-      stopAllDispenseMotors();
       Serial.println("MOTOR_CLOSE_LIMIT_REACHED");
       finishDispenseCycle();
     }
@@ -665,6 +664,7 @@ void completeDispenseCycle()
 
 void finishDispenseCycle()
 {
+  stopAllDispenseMotors();
   Serial.println("MOTOR_STOPPED");
   Serial.print("DISPENSE_DONE:");
   Serial.println(currentWeightKg, 2);
