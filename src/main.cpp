@@ -93,6 +93,7 @@ float dispensingRateKgPerSec = 0.0;
 unsigned long previousRateSampleMs = 0;
 unsigned long lastPositiveRateMs = 0;
 bool rateSampleReady = false;
+bool motorLimitReleasedDuringDispense = false;
 
 // ---- Serial command buffer ----
 String serialBuffer = "";
@@ -451,6 +452,11 @@ void processCommand(String cmd)
     Serial.print("TOTAL:");
     Serial.println(totalMoney);
   }
+  else if (cmd == "GET_LIMIT")
+  {
+    Serial.print("MOTOR_LIMIT:");
+    Serial.println(digitalRead(MOTOR_CLOSED_LIMIT_PIN) == MOTOR_CLOSED_LIMIT_ACTIVE ? "ACTIVE" : "OPEN");
+  }
   else if (cmd == "RESET_TOTAL")
   {
     totalMoney = 0;
@@ -539,6 +545,7 @@ void startDispense(String riceType, float kg)
     weightSamples[index] = 0;
   lastWeightReadMs = 0;
   cycleState = DISPENSING;
+  motorLimitReleasedDuringDispense = false;
   stateStartMs = millis();
   lastPositiveRateMs = stateStartMs;
 
@@ -554,6 +561,12 @@ void startDispense(String riceType, float kg)
 void runCycleStateMachine()
 {
   unsigned long now = millis();
+
+  if ((cycleState == DISPENSING || cycleState == DISPENSE_SETTLING) &&
+      digitalRead(MOTOR_CLOSED_LIMIT_PIN) != MOTOR_CLOSED_LIMIT_ACTIVE)
+  {
+    motorLimitReleasedDuringDispense = true;
+  }
 
   switch (cycleState)
   {
@@ -609,11 +622,7 @@ void runCycleStateMachine()
     break;
 
   case DISPENSE_CLOSE_PAUSE:
-    if (digitalRead(MOTOR_CLOSED_LIMIT_PIN) == MOTOR_CLOSED_LIMIT_ACTIVE)
-    {
-      finishDispenseCycle();
-    }
-    else if (now - stateStartMs >= MOTOR_DIRECTION_DEADTIME_MS)
+    if (now - stateStartMs >= MOTOR_DIRECTION_DEADTIME_MS)
     {
       startSelectedDispenseMotorClosing();
       Serial.println("MOTOR_CLOSING");
@@ -658,6 +667,15 @@ void runCycleStateMachine()
 void completeDispenseCycle()
 {
   stopAllDispenseMotors();
+  if (!motorLimitReleasedDuringDispense)
+  {
+    Serial.println("ERROR:MOTOR_CLOSE_LIMIT_STUCK_ACTIVE");
+    cycleState = IDLE;
+    selectedRiceType = "";
+    selectedMotor = 0;
+    currentDispenseSpeed = 0;
+    return;
+  }
   cycleState = DISPENSE_CLOSE_PAUSE;
   stateStartMs = millis();
 }
