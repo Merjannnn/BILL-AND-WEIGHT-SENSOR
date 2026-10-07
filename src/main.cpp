@@ -47,7 +47,7 @@ long totalMoney = 0;
 #define LPWM3 45
 #define R_EN3 46
 #define L_EN3 47
-const byte MOTOR_CLOSED_LIMIT_PIN = 24;
+const byte MOTOR_CLOSED_LIMIT_PINS[] = {24, 25, 26};
 const byte MOTOR_CLOSED_LIMIT_ACTIVE = LOW;
 const int DISPENSE_SPEED = 255;
 const int APPROACH_SPEED_1 = 200;
@@ -148,7 +148,8 @@ void setup()
   // Bill / Coin
   pinMode(billPin, INPUT_PULLUP);
   pinMode(coinPin, INPUT_PULLUP);
-  pinMode(MOTOR_CLOSED_LIMIT_PIN, INPUT_PULLUP);
+  for (byte motor = 0; motor < 3; motor++)
+    pinMode(MOTOR_CLOSED_LIMIT_PINS[motor], INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(billPin), billISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(coinPin), coinISR, FALLING);
 
@@ -454,8 +455,16 @@ void processCommand(String cmd)
   }
   else if (cmd == "GET_LIMIT")
   {
-    Serial.print("MOTOR_LIMIT:");
-    Serial.println(digitalRead(MOTOR_CLOSED_LIMIT_PIN) == MOTOR_CLOSED_LIMIT_ACTIVE ? "ACTIVE" : "OPEN");
+    for (byte motor = 0; motor < 3; motor++)
+    {
+      Serial.print("MOTOR");
+      Serial.print(motor + 1);
+      Serial.print("_LIMIT:");
+      Serial.println(
+          digitalRead(MOTOR_CLOSED_LIMIT_PINS[motor]) == MOTOR_CLOSED_LIMIT_ACTIVE
+              ? "ACTIVE"
+              : "OPEN");
+    }
   }
   else if (cmd == "RESET_TOTAL")
   {
@@ -563,7 +572,7 @@ void runCycleStateMachine()
   unsigned long now = millis();
 
   if ((cycleState == DISPENSING || cycleState == DISPENSE_SETTLING) &&
-      digitalRead(MOTOR_CLOSED_LIMIT_PIN) != MOTOR_CLOSED_LIMIT_ACTIVE)
+      digitalRead(MOTOR_CLOSED_LIMIT_PINS[selectedMotor - 1]) != MOTOR_CLOSED_LIMIT_ACTIVE)
   {
     motorLimitReleasedDuringDispense = true;
   }
@@ -632,7 +641,7 @@ void runCycleStateMachine()
     break;
 
   case DISPENSE_CLOSING:
-    if (digitalRead(MOTOR_CLOSED_LIMIT_PIN) == MOTOR_CLOSED_LIMIT_ACTIVE)
+    if (digitalRead(MOTOR_CLOSED_LIMIT_PINS[selectedMotor - 1]) == MOTOR_CLOSED_LIMIT_ACTIVE)
     {
       Serial.println("MOTOR_CLOSE_LIMIT_REACHED");
       finishDispenseCycle();
